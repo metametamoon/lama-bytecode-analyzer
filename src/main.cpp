@@ -653,7 +653,7 @@ void print_results(std::vector<std::pair<InstructionBlock, i32>> &sorted_result,
       total_str += decoded.decoded;
       total_str += ";";
     }
-    total_str += " (" + std::to_string(instr.size_bytes) + "B)";
+    total_str += " (block_length=" + std::to_string(instr.size_bytes) + "B)";
     printf("cnt=%d: %s\n", occurences, total_str.c_str());
   }
 }
