@@ -572,10 +572,10 @@ struct InstructionBlockCompare {
   }
 };
 
-void account_instruction_blocks(
+void calculate_instruction_blocks_freq(
     i32 inst_per_block_incl_upper_bound,
     std::vector<std::pair<InstructionBlock, i32>> &out, bytefile const *bf,
-    std::vector<u8 *> const &incoming_cf) {
+    std::unordered_set<u8 *> const &incoming_cf) {
   std::map<InstructionBlock, i32, InstructionBlockCompare> counter;
   std::vector<u8 *> instruction_stack;
   for (i32 i = 0; i < bf->public_symbols_number; i++) {
@@ -623,8 +623,7 @@ void account_instruction_blocks(
         break;
       }
       read_ip = sub_result.next_ip;
-      bool cf_doesnt_come_in = std::find(incoming_cf.begin(), incoming_cf.end(),
-                                         read_ip) == incoming_cf.end();
+      bool cf_doesnt_come_in = incoming_cf.count(read_ip) == 0;
       if (!cf_doesnt_come_in) {
         success = false;
         break;
@@ -659,12 +658,12 @@ void print_results(std::vector<std::pair<InstructionBlock, i32>> &sorted_result,
   }
 }
 
-void gather_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
+void gather_incoming_cf(bytefile const *bf, std::unordered_set<u8 *> &result) {
   std::vector<u8 *> instruction_stack;
   for (i32 i = 0; i < bf->public_symbols_number; i++) {
-    u8* public_symbol_entry_ip = bf->code_ptr + get_public_offset(bf, i);
+    u8 *public_symbol_entry_ip = bf->code_ptr + get_public_offset(bf, i);
     instruction_stack.push_back(public_symbol_entry_ip);
-    result.push_back(public_symbol_entry_ip);
+    result.insert(public_symbol_entry_ip);
   }
   std::unordered_set<u8 *> visited;
   auto push_if_not_visited = [&visited, &instruction_stack,
@@ -686,7 +685,7 @@ void gather_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
       push_if_not_visited(decoded.next_ip);
     }
     if (decoded.jump_ip != nullptr) {
-      result.push_back(decoded.jump_ip);
+      result.insert(decoded.jump_ip);
     }
   }
 }
@@ -694,11 +693,9 @@ void gather_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
 int main(int argc, char *argv[]) {
   bytefile const *bf = read_file(argv[1]);
   std::vector<std::pair<InstructionBlock, i32>> result;
-  std::vector<u8 *> bytecodes_with_incoming_cf;
+  std::unordered_set<u8 *> bytecodes_with_incoming_cf;
   gather_incoming_cf(bf, bytecodes_with_incoming_cf);
-
-  // account_instruction_blocks(1, result, bf, bytecodes_with_incoming_cf);
-  account_instruction_blocks(2, result, bf, bytecodes_with_incoming_cf);
+  calculate_instruction_blocks_freq(2, result, bf, bytecodes_with_incoming_cf);
   std::sort(result.begin(), result.end(),
             [](std::pair<InstructionBlock, i32> const &x,
                std::pair<InstructionBlock, i32> const &y) {
