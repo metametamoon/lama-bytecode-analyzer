@@ -578,8 +578,10 @@ void account_instruction_blocks(
     std::vector<u8 *> const &incoming_cf) {
   std::map<InstructionBlock, i32, InstructionBlockCompare> counter;
   std::vector<u8 *> instruction_stack;
+  for (i32 i = 0; i < bf->public_symbols_number; i++) {
+    instruction_stack.push_back(bf->code_ptr + get_public_offset(bf, i));
+  }
   std::unordered_set<u8 *> visited;
-  instruction_stack.push_back(bf->code_ptr);
   auto push_if_not_visited = [&visited, &instruction_stack,
                               &bf](u8 *possible_ip) {
     if (visited.count(possible_ip) == 0) {
@@ -657,10 +659,14 @@ void print_results(std::vector<std::pair<InstructionBlock, i32>> &sorted_result,
   }
 }
 
-void account_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
+void gather_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
   std::vector<u8 *> instruction_stack;
+  for (i32 i = 0; i < bf->public_symbols_number; i++) {
+    u8* public_symbol_entry_ip = bf->code_ptr + get_public_offset(bf, i);
+    instruction_stack.push_back(public_symbol_entry_ip);
+    result.push_back(public_symbol_entry_ip);
+  }
   std::unordered_set<u8 *> visited;
-  instruction_stack.push_back(bf->code_ptr);
   auto push_if_not_visited = [&visited, &instruction_stack,
                               &bf](u8 *possible_ip) {
     if (visited.count(possible_ip) == 0) {
@@ -689,7 +695,7 @@ int main(int argc, char *argv[]) {
   bytefile const *bf = read_file(argv[1]);
   std::vector<std::pair<InstructionBlock, i32>> result;
   std::vector<u8 *> bytecodes_with_incoming_cf;
-  account_incoming_cf(bf, bytecodes_with_incoming_cf);
+  gather_incoming_cf(bf, bytecodes_with_incoming_cf);
 
   // account_instruction_blocks(1, result, bf, bytecodes_with_incoming_cf);
   account_instruction_blocks(2, result, bf, bytecodes_with_incoming_cf);
