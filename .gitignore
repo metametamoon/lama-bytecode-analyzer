@@ -1,3 +1,4 @@
 **/*.bc
 build/*
 bytecodes/*
+**.draft

@@ -165,14 +165,18 @@ static inline void located_error(bytefile const *bf, u8 *next_ip,
   va_end(argptr);
 }
 
-struct DecodeResult {
-  std::string command;
-  u8 *next_ip; // write after
+// by convention if no jump might be possible, it is in next_ip
+// if jump is possible, it is in alternative_next_ip
+struct InstructionResult {
+  u8 *next_ip; // always not null, needed for proper traversing the program
+  bool is_next_child;
+  u8 *jump_ip;
+  std::string decoded;
+  bool is_end; // END or RET
 };
 
-static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
-  char buff[100];
-  i32 offset = 0;
+static inline InstructionResult run_instruction(u8 *ip, bytefile const *bf,
+                                                bool print_inst) {
 #define FAIL                                                                   \
   {                                                                            \
     printf("ERROR: invalid opcode %d-%d\n", h, l);                             \
@@ -200,14 +204,28 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
   static char const *const pats[] = {"=str", "#string", "#array", "#sexp",
                                      "#ref", "#val",    "#fun"};
   static char const *const lds[] = {"LD", "LDA", "ST"};
+  // bool in_closure = false;
+  auto check_is_begin = [](bytefile const *bf, u8 *ip) {
+    if (!check_address(bf, ip)) {
+      return false;
+    }
+    u8 x = *ip;
+    u8 h = (x & 0xF0) >> 4, l = x & 0x0F;
+    return h == 5 && (l == 3 || l == 2);
+  };
+  char buff[100];
+  int offset = 0;
 
   if (ip >= bf->code_end) {
     error("execution unexpectedly got out of code section\n");
   }
   u8 x = read_byte(), h = (x & 0xF0) >> 4, l = x & 0x0F;
+
   switch ((HCode)h) {
-  case HCode::STOP:
-    goto stop;
+  case HCode::STOP: {
+    debug(stderr, "<end>\n");
+    return InstructionResult{ip, false, nullptr, "<end>", true};
+  }
 
   case HCode::BINOP: {
     offset += sprintf(buff + offset, "BINOP\t%s", ops[l - 1]);
@@ -252,23 +270,34 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
 
     case Misc1LCode::JMP: {
       auto jump_location = read_int();
-      offset += sprintf(buff + offset, "JMP\t0x%.8x\n", jump_location);
+      offset += sprintf(buff + offset, "JMP\t0x%.8x", jump_location);
+      u8 *jump_ip = bf->code_ptr + jump_location;
+      if (!check_address(bf, jump_ip)) {
+        print_location(bf, ip);
+        fprintf(stderr, "trying to jump out of the code area to offset %d",
+                jump_ip - bf->code_ptr);
+      }
+      return InstructionResult{ip, false, jump_ip, std::string{buff}, false};
       break;
     }
 
     case Misc1LCode::END:
     case Misc1LCode::RET: {
       if (h == 7) {
-        offset += sprintf(buff + offset, "RET\n");
+        offset += sprintf(buff + offset, "RET");
       } else {
-        offset += sprintf(buff + offset, "END\n");
+        offset += sprintf(buff + offset, "END");
       }
+      return InstructionResult{
+          ip, false, nullptr, std::string{buff}, true,
+      };
       break;
     }
 
-    case Misc1LCode::DROP:
+    case Misc1LCode::DROP: {
       offset += sprintf(buff + offset, "DROP");
       break;
+    }
 
     case Misc1LCode::DUP: {
       offset += sprintf(buff + offset, "DUP");
@@ -319,12 +348,32 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
     case Misc2LCode::CJMPZ: {
       auto jump_location = read_int();
       offset += sprintf(buff + offset, "CJMPz\t0x%.8x", jump_location);
+      auto possible_next = ip;
+
+      u8 *jump_ip = bf->code_ptr + jump_location;
+      if (!check_address(bf, jump_ip)) {
+        print_location(bf, ip);
+        fprintf(stderr, "trying to jump out of the code area to offset %d",
+                jump_ip - bf->code_ptr);
+      }
+      auto result = InstructionResult{possible_next, true, jump_ip,
+                                      std::string{buff}, false};
+      return result;
       break;
     }
 
     case Misc2LCode::CJMPNZ: {
       auto jump_location = read_int();
       offset += sprintf(buff + offset, "CJMPz\t0x%.8x", jump_location);
+      u8 *jump_ip = bf->code_ptr + jump_location;
+      if (!check_address(bf, jump_ip)) {
+        print_location(bf, ip);
+        fprintf(stderr, "trying to jump out of the code area to offset %d",
+                jump_ip - bf->code_ptr);
+      }
+      auto result =
+          InstructionResult{ip, true, jump_ip, std::string{buff}, false};
+      return result;
       break;
     }
 
@@ -343,6 +392,13 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
     case Misc2LCode::CLOSURE: {
       int addr = read_int();
       offset += sprintf(buff + offset, "CLOSURE\t0x%.8x", addr);
+
+      if (addr < 0 || addr > (bf->code_end - bf->code_ptr)) {
+        located_error(bf, ip, "closure points outside of the code area\n");
+      }
+      if (!check_is_begin(bf, bf->code_ptr + addr)) {
+        located_error(bf, ip, "closure does not point at begin\n");
+      }
       int n = read_int();
       for (int i = 0; i < n; i++) {
         switch (read_byte()) {
@@ -376,7 +432,6 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
     case Misc2LCode::CALLC: {
       int n_arg = read_int();
       offset += sprintf(buff + offset, "CALLC\t%d", n_arg);
-      //  skip closure call
       break;
     }
 
@@ -385,6 +440,14 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
       int n = read_int();
       offset += sprintf(buff + offset, "CALL\t0x%.8x ", loc);
       offset += sprintf(buff + offset, "%d", n);
+      auto called_function_begin = bf->code_ptr + loc;
+      if (!check_is_begin(bf, called_function_begin)) {
+        located_error(bf, ip, "CALL does not call a function\n");
+        ;
+      }
+      return InstructionResult{
+          ip, true, called_function_begin, std::string{buff}, false,
+      };
       break;
     }
 
@@ -402,11 +465,13 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
       break;
     }
 
-    case Misc2LCode::FAILURE:
+    case Misc2LCode::FAILURE: {
+      int line = read_int();
       offset += sprintf(buff + offset, "FAIL\t%d", read_int());
       offset += sprintf(buff + offset, "%d", read_int());
-      // exit(-1); --
+      return InstructionResult{ip, false, nullptr, std::string{buff}, true};
       break;
+    }
 
     case Misc2LCode::LINE: {
       int line = read_int();
@@ -464,348 +529,11 @@ static inline DecodeResult opcode_to_string(u8 *ip, bytefile const *bf) {
   default:
     FAIL;
   }
-  return DecodeResult{std::string{buff}, ip};
-stop:
-  debug(stderr, "<end>\n");
-  return DecodeResult{std::string{"<end>\n"}, ip};
-}
-
-// by convention if no jump might be possible, it is in next_ip
-// if jump is possible, it is in alternative_next_ip
-struct InstructionResult {
-  u8 *next_ip;
-  u8 *alternative_next_ip;
-};
-
-static inline InstructionResult run_instruction(u8 *ip, bytefile const *bf,
-                                                bool print_inst) {
-#define FAIL                                                                   \
-  {                                                                            \
-    printf("ERROR: invalid opcode %d-%d\n", h, l);                             \
-    exit(0);                                                                   \
+  std::string decoded{buff};
+  if (print_inst) {
+    fprintf(stderr, "%s; next=%x\n", decoded.c_str(), ip - bf->code_ptr);
   }
-
-  auto read_int = [&ip, &bf]() {
-    check_address(bf, ip);
-    ip += sizeof(int);
-    return *(int *)(ip - sizeof(int));
-  };
-
-  auto read_byte = [&ip, &bf]() {
-    check_address(bf, ip);
-    return *ip++;
-  };
-
-  auto read_string = [&read_int, &ip, &bf]() {
-    check_address(bf, ip);
-    return get_string(bf, read_int());
-  };
-
-  static char const *const ops[] = {
-      "+", "-", "*", "/", "%", "<", "<=", ">", ">=", "==", "!=", "&&", "!!"};
-  static char const *const pats[] = {"=str", "#string", "#array", "#sexp",
-                                     "#ref", "#val",    "#fun"};
-  static char const *const lds[] = {"LD", "LDA", "ST"};
-  // bool in_closure = false;
-  auto check_is_begin = [](bytefile const *bf, u8 *ip) {
-    if (!check_address(bf, ip)) {
-      return false;
-    }
-    u8 x = *ip;
-    u8 h = (x & 0xF0) >> 4, l = x & 0x0F;
-    return h == 5 && (l == 3 || l == 2);
-  };
-
-  do {
-    if (ip >= bf->code_end) {
-      error("execution unexpectedly got out of code section\n");
-    }
-    if (print_inst) {
-      fprintf(stderr, "0x%.8x:\t", unsigned(ip - bf->code_ptr));
-      auto result = opcode_to_string(ip, bf);
-      fprintf(stderr, "%s\n", result.command.c_str());
-    }
-
-    u8 x = read_byte(), h = (x & 0xF0) >> 4, l = x & 0x0F;
-
-    switch ((HCode)h) {
-    case HCode::STOP:
-      goto stop;
-
-    case HCode::BINOP: {
-      if (l - 1 < (i32)BinopLabel::BINOP_LAST) {
-      } else {
-        FAIL;
-      }
-      break;
-    }
-
-    case HCode::MISC1: {
-      switch ((Misc1LCode)l) {
-      case Misc1LCode::CONST: {
-        auto arg = read_int();
-        break;
-      }
-
-      case Misc1LCode::STR: {
-        char const *string = read_string();
-        break;
-      }
-
-      case Misc1LCode::SEXP: {
-        char const *tag = read_string();
-        int n = read_int();
-        break;
-      }
-
-      case Misc1LCode::STI: {
-        break;
-      }
-
-      case Misc1LCode::STA: {
-        break;
-      }
-
-      case Misc1LCode::JMP: {
-        auto jump_location = read_int();
-        u8 *old_ip = ip;
-        u8 *jump_ip = bf->code_ptr + jump_location;
-        if (!check_address(bf, jump_ip)) {
-          print_location(bf, old_ip);
-          fprintf(stderr, "trying to jump out of the code area to offset %d",
-                  jump_ip - bf->code_ptr);
-        }
-        return InstructionResult{nullptr, jump_ip};
-        break;
-      }
-
-      case Misc1LCode::END:
-      case Misc1LCode::RET: {
-        if (h == 7) {
-        } else {
-        }
-        return InstructionResult{
-            nullptr,
-            nullptr,
-        };
-        break;
-      }
-
-      case Misc1LCode::DROP:
-        break;
-
-      case Misc1LCode::DUP: {
-        break;
-      }
-
-      case Misc1LCode::SWAP: {
-        break;
-      }
-
-      case Misc1LCode::ELEM: {
-        break;
-      }
-
-      default:
-        FAIL;
-      }
-      break;
-    }
-    case HCode::LD:
-    case HCode::LDA:
-    case HCode::ST: {
-      i32 const index = read_int();
-      switch (l) {
-      case 0:
-        break;
-      case 1:
-        break;
-      case 2:
-        break;
-      case 3:
-        break;
-      default:
-        FAIL;
-      }
-      break;
-    }
-
-    case HCode::MISC2: {
-      switch ((Misc2LCode)l) {
-      case Misc2LCode::CJMPZ: {
-        auto jump_location = read_int();
-        auto possible_next = ip;
-        auto result = InstructionResult{
-            possible_next,
-            nullptr,
-        };
-        u8 *jump_ip = bf->code_ptr + jump_location;
-        if (!check_address(bf, jump_ip)) {
-          print_location(bf, ip);
-          fprintf(stderr, "trying to jump out of the code area to offset %d",
-                  jump_ip - bf->code_ptr);
-        }
-        result.alternative_next_ip = jump_ip;
-        return result;
-        break;
-      }
-
-      case Misc2LCode::CJMPNZ: {
-        auto jump_location = read_int();
-        auto possible_next = ip;
-        auto result = InstructionResult{
-            possible_next,
-            nullptr,
-        };
-        u8 *jump_ip = bf->code_ptr + jump_location;
-        if (!check_address(bf, jump_ip)) {
-          print_location(bf, ip);
-          fprintf(stderr, "trying to jump out of the code area to offset %d",
-                  jump_ip - bf->code_ptr);
-        }
-        result.alternative_next_ip = jump_ip;
-        return result;
-        break;
-      }
-
-      case Misc2LCode::BEGIN:
-      case Misc2LCode::CBEGIN: {
-        int n_args = read_int();
-        int n_locals = read_int();
-        if (l == 3) {
-        }
-        break;
-      }
-
-      case Misc2LCode::CLOSURE: {
-        int addr = read_int();
-        if (addr < 0 || addr > (bf->code_end - bf->code_ptr)) {
-          located_error(bf, ip, "closure points outside of the code area\n");
-        }
-        if (!check_is_begin(bf, bf->code_ptr + addr)) {
-          located_error(bf, ip, "closure does not point at begin\n");
-        }
-        int n = read_int();
-        for (int i = 0; i < n; i++) {
-          switch (read_byte()) {
-          case 0: {
-            int index = read_int();
-            break;
-          }
-          case 1: {
-            int index = read_int();
-            break;
-          }
-          case 2: {
-            int index = read_int();
-            break;
-          }
-          case 3: {
-            int index = read_int();
-            break;
-          }
-          default:
-            FAIL;
-          }
-        }
-        break;
-      };
-
-      case Misc2LCode::CALLC: {
-        int n_arg = read_int();
-        //  skip closure call
-        break;
-      }
-
-      case Misc2LCode::CALL: {
-        int loc = read_int();
-        int n = read_int();
-        auto called_function_begin = bf->code_ptr + loc;
-        if (!check_is_begin(bf, called_function_begin)) {
-          located_error(bf, ip, "CALL does not call a function\n");
-          ;
-        }
-        return InstructionResult{
-            ip,
-            called_function_begin,
-        };
-        break;
-      }
-
-      case Misc2LCode::TAG: {
-        const char *name = read_string();
-        int n = read_int();
-        break;
-      }
-
-      case Misc2LCode::ARRAY: {
-        int size = read_int();
-        break;
-      }
-
-      case Misc2LCode::FAILURE: {
-        return InstructionResult{
-            nullptr,
-            nullptr,
-        };
-        break;
-      }
-
-      case Misc2LCode::LINE: {
-        int line = read_int();
-        break;
-      }
-
-      default:
-        FAIL;
-      }
-      break;
-    }
-    case HCode::PATT: {
-      if (l == 0) { // =str
-      } else if (l < (i32)Patt::LAST) {
-      } else {
-        fprintf(stderr, "Unsupported patt specializer: %d", l);
-        FAIL;
-      }
-      break;
-    }
-    case HCode::CALL: {
-      switch ((Call)l) {
-      case Call::READ: {
-        break;
-      }
-
-      case Call::WRITE: {
-        break;
-      }
-      case Call::LLENGTH: {
-        break;
-      }
-
-      case Call::LSTRING: {
-        break;
-      }
-
-      case Call::BARRAY: {
-        i32 n = read_int();
-        break;
-      }
-
-      default:
-        FAIL;
-      }
-    } break;
-
-    default:
-      FAIL;
-    }
-
-    return InstructionResult{ip, nullptr};
-  } while (1);
-stop:
-  debug(stderr, "<end>\n");
-  return InstructionResult{nullptr, nullptr};
+  return InstructionResult{ip, true, nullptr, decoded, false};
 }
 
 /* Dumps the contents of the file */
@@ -849,44 +577,48 @@ void account_instruction_blocks(
     i32 inst_per_block, std::vector<std::pair<InstructionBlock, i32>> &out,
     bytefile const *bf) {
   std::map<InstructionBlock, i32, InstructionBlockCompare> counter;
-  std::vector<u8 *> dfs_queue;
+  std::vector<u8 *> instuction_stack;
   std::unordered_set<u8 *> visited; // was at some point put in the dfs_queue
-  dfs_queue.push_back(bf->code_ptr);
-  auto push_if_not_visited = [&visited, &dfs_queue, &bf](u8 *possible_ip) {
+  instuction_stack.push_back(bf->code_ptr);
+  auto push_if_not_visited = [&visited, &instuction_stack,
+                              &bf](u8 *possible_ip) {
     if (visited.count(possible_ip) == 0) {
-      dfs_queue.push_back(possible_ip);
+      instuction_stack.push_back(possible_ip);
       visited.insert(possible_ip);
       // fprintf(stderr, "enqueued %x\n", possible_ip - bf->code_ptr);
     }
   };
 
-  while (!dfs_queue.empty()) {
-    u8 *ip = dfs_queue.back();
-    dfs_queue.pop_back();
+  while (!instuction_stack.empty()) {
+    u8 *ip = instuction_stack.back();
+    instuction_stack.pop_back();
 
     auto const result = run_instruction(ip, bf, false);
-    if (result.alternative_next_ip != nullptr) {
-      push_if_not_visited(result.alternative_next_ip);
+    if (result.jump_ip != nullptr) {
+      push_if_not_visited(result.jump_ip);
     }
-    if (result.next_ip != nullptr) {
+    if (result.is_next_child && !result.is_end && result.next_ip != nullptr) {
       push_if_not_visited(result.next_ip);
     }
-    if (result.next_ip != nullptr) {
-      u8 *read_ip = result.next_ip;
-      bool success = true;
-      for (i32 i = 0; i < inst_per_block - 1; ++i) {
-        auto subResult = run_instruction(read_ip, bf, false);
-        if (subResult.alternative_next_ip != nullptr ||
-            subResult.next_ip == nullptr) {
-          success = false;
-          break;
-        }
-        read_ip = subResult.next_ip;
+    u8 *read_ip = ip;
+    bool success = true;
+    for (i32 i = 0; i < inst_per_block - 1; ++i) {
+      auto subResult = i == 0 ? result : run_instruction(read_ip, bf, false);
+      read_ip = subResult.next_ip;
+
+      bool cf_doesnt_come_out =
+          subResult.jump_ip == nullptr && !subResult.is_end;
+      bool isJumpOrCall = subResult.jump_ip != nullptr;
+      if (isJumpOrCall || subResult.is_end) {
+        success = false;
+        break;
       }
-      if (success) {
-        InstructionBlock block = InstructionBlock{ip, (u8)(read_ip - ip)};
-        counter[block] += 1;
-      }
+    }
+    if (success) {
+      auto last_inst = run_instruction(read_ip, bf, false);
+      InstructionBlock block =
+          InstructionBlock{ip, (u8)(last_inst.next_ip - ip)};
+      counter[block] += 1;
     }
   }
   for (auto [key, value] : counter) {
@@ -895,16 +627,18 @@ void account_instruction_blocks(
   }
 }
 
-void print_results(std::vector<std::pair<InstructionBlock, i32>>& sorted_result, bytefile const *bf) {
+void print_results(std::vector<std::pair<InstructionBlock, i32>> &sorted_result,
+                   bytefile const *bf) {
   for (auto [instr, occurences] : sorted_result) {
     std::string total_str;
     u8 *inp = instr.begin;
     while (inp != instr.begin + instr.size_bytes) {
-      auto decoded = opcode_to_string(inp, bf);
+      auto decoded = run_instruction(inp, bf, false);
       inp = decoded.next_ip;
-      total_str += decoded.command;
+      total_str += decoded.decoded;
       total_str += ";";
     }
+    total_str += " (" + std::to_string(instr.size_bytes) + "B)";
     printf("cnt=%d: %s\n", occurences, total_str.c_str());
   }
 }
@@ -920,6 +654,6 @@ int main(int argc, char *argv[]) {
               return x.second > y.second;
             });
   print_results(result, bf);
-  
+
   return 0;
 }
