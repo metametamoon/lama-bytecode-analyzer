@@ -466,7 +466,6 @@ static inline InstructionResult run_instruction(u8 *ip, bytefile const *bf,
     }
 
     case Misc2LCode::FAILURE: {
-      int line = read_int();
       offset += sprintf(buff + offset, "FAIL\t%d", read_int());
       offset += sprintf(buff + offset, "%d", read_int());
       return InstructionResult{ip, false, nullptr, std::string{buff}, true};
@@ -575,41 +574,45 @@ struct InstructionBlockCompare {
 
 void account_instruction_blocks(
     i32 inst_per_block, std::vector<std::pair<InstructionBlock, i32>> &out,
-    bytefile const *bf) {
+    bytefile const *bf, std::vector<u8 *> const &incoming_cf) {
   std::map<InstructionBlock, i32, InstructionBlockCompare> counter;
-  std::vector<u8 *> instuction_stack;
+  std::vector<u8 *> instruction_stack;
   std::unordered_set<u8 *> visited; // was at some point put in the dfs_queue
-  instuction_stack.push_back(bf->code_ptr);
-  auto push_if_not_visited = [&visited, &instuction_stack,
+  instruction_stack.push_back(bf->code_ptr);
+  auto push_if_not_visited = [&visited, &instruction_stack,
                               &bf](u8 *possible_ip) {
     if (visited.count(possible_ip) == 0) {
-      instuction_stack.push_back(possible_ip);
+      instruction_stack.push_back(possible_ip);
       visited.insert(possible_ip);
       // fprintf(stderr, "enqueued %x\n", possible_ip - bf->code_ptr);
     }
   };
 
-  while (!instuction_stack.empty()) {
-    u8 *ip = instuction_stack.back();
-    instuction_stack.pop_back();
+  while (!instruction_stack.empty()) {
+    u8 *ip = instruction_stack.back();
+    instruction_stack.pop_back();
 
     auto const result = run_instruction(ip, bf, false);
     if (result.jump_ip != nullptr) {
       push_if_not_visited(result.jump_ip);
     }
-    if (result.is_next_child && !result.is_end && result.next_ip != nullptr) {
+    if (result.is_next_child && !result.is_end) {
       push_if_not_visited(result.next_ip);
     }
     u8 *read_ip = ip;
     bool success = true;
     for (i32 i = 0; i < inst_per_block - 1; ++i) {
       auto subResult = i == 0 ? result : run_instruction(read_ip, bf, false);
-      read_ip = subResult.next_ip;
-
       bool cf_doesnt_come_out =
           subResult.jump_ip == nullptr && !subResult.is_end;
-      bool isJumpOrCall = subResult.jump_ip != nullptr;
-      if (isJumpOrCall || subResult.is_end) {
+      if (!cf_doesnt_come_out) {
+        success = false;
+        break;
+      }
+      read_ip = subResult.next_ip;
+      bool cf_doesnt_come_in = std::find(incoming_cf.begin(), incoming_cf.end(),
+                                         read_ip) == incoming_cf.end();
+      if (!cf_doesnt_come_in) {
         success = false;
         break;
       }
@@ -622,7 +625,6 @@ void account_instruction_blocks(
     }
   }
   for (auto [key, value] : counter) {
-    // run_instruction(key->begin, bf);
     out.push_back({key, value});
   }
 }
@@ -643,11 +645,43 @@ void print_results(std::vector<std::pair<InstructionBlock, i32>> &sorted_result,
   }
 }
 
+void account_incoming_cf(bytefile const *bf, std::vector<u8 *> &result) {
+  std::vector<u8 *> instruction_stack;
+  std::unordered_set<u8 *> visited;
+  instruction_stack.push_back(bf->code_ptr);
+  auto push_if_not_visited = [&visited, &instruction_stack,
+                              &bf](u8 *possible_ip) {
+    if (visited.count(possible_ip) == 0) {
+      instruction_stack.push_back(possible_ip);
+      visited.insert(possible_ip);
+      // fprintf(stderr, "enqueued %x\n", possible_ip - bf->code_ptr);
+    }
+  };
+
+  while (!instruction_stack.empty()) {
+    u8 *ip = instruction_stack.back();
+    instruction_stack.pop_back();
+    auto const decoded = run_instruction(ip, bf, false);
+    if (decoded.jump_ip != nullptr) {
+      push_if_not_visited(decoded.jump_ip);
+    }
+    if (decoded.is_next_child && !decoded.is_end) {
+      push_if_not_visited(decoded.next_ip);
+    }
+    if (decoded.jump_ip != nullptr) {
+      result.push_back(decoded.jump_ip);
+    }
+  }
+}
+
 int main(int argc, char *argv[]) {
   bytefile const *bf = read_file(argv[1]);
   std::vector<std::pair<InstructionBlock, i32>> result;
-  account_instruction_blocks(1, result, bf);
-  account_instruction_blocks(2, result, bf);
+  std::vector<u8 *> bytecodes_with_incoming_cf;
+  account_incoming_cf(bf, bytecodes_with_incoming_cf);
+
+  account_instruction_blocks(1, result, bf, bytecodes_with_incoming_cf);
+  account_instruction_blocks(2, result, bf, bytecodes_with_incoming_cf);
   std::sort(result.begin(), result.end(),
             [](std::pair<InstructionBlock, i32> const &x,
                std::pair<InstructionBlock, i32> const &y) {

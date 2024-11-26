@@ -4,7 +4,7 @@ TESTS=$(notdir $(T1))
 
 build/analyzer: src/main.cpp src/bytefile.cpp
 	mkdir -p build
-	g++ -m32 -g2 -fstack-protector-all -Wall -Werror -Wno-unused-variable src/main.cpp src/bytefile.cpp -o build/analyzer
+	g++ -m32 -g2 -fstack-protector-all -Wall -Werror src/main.cpp src/bytefile.cpp -o build/analyzer
 
 
 .PHONY: test $(TESTS)
